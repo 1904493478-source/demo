@@ -8,6 +8,31 @@ import RecordFullDetailScreen from "@/components/RecordFullDetailScreen";
 import Records from "@/pages/Records";
 import { aiConversationLogEntries } from "@/data/aiConversationLog";
 import { useCandidateProfile } from "@/data/candidateProfile";
+import ArrangementsPage from "@/features/arrangements/components/ArrangementsPage";
+import {
+  aiCandidateStorageEvent,
+  aiCandidateStorageKey,
+  loadAiCandidates,
+  upsertAiCandidate,
+} from "@/features/arrangements/data/aiCandidateStore";
+import { loadArrangements, saveArrangements } from "@/features/arrangements/data/arrangementStore";
+import { recognizeArrangementCompletion } from "@/features/arrangements/data/arrangementCompletionRecognition";
+import { loadAiSettings } from "@/features/arrangements/data/aiSettingsStore";
+import {
+  recognizeArrangementCompletionWithAi,
+  recognizeGroupChatArrangementWithAi,
+  recognizePrivateChatArrangementWithAi,
+} from "@/features/arrangements/data/aiArrangementClient";
+import {
+  buildPrivateChatCandidateId,
+  recognizePrivateChatArrangement,
+  type PrivateChatRecognitionResult,
+} from "@/features/arrangements/data/privateChatRecognition";
+import {
+  buildGroupChatCandidateId,
+  recognizeGroupChatArrangement,
+} from "@/features/arrangements/data/groupChatRecognition";
+import { markArrangementMaybeCompleted } from "@/features/arrangements/lib/arrangementState";
 import {
   createTestReplyMessage,
   demoSenderIdentityId,
@@ -57,6 +82,7 @@ type TabItem = {
 
 const tabs: TabItem[] = [
   { key: "records" },
+  { key: "arrangements" },
   { key: "insight" },
   { key: "mine" },
 ];
@@ -67,6 +93,7 @@ const createdSelfRecordsStorageKey = "arkme-demo.selfRecords";
 const searchHistoryStorageKey = "arkme-demo.searchHistory";
 const aiConversationTotalCount = aiConversationLogEntries.length;
 const maxSearchHistoryCount = 4;
+const aiRecognitionFeedbackDurationMs = 2400;
 
 type QuickSearchType = "image" | "audio" | "link" | "file" | "longArticle" | "contact";
 
@@ -318,6 +345,182 @@ function openExternalLink(url: string) {
   window.open(url, "_blank", "noopener,noreferrer");
 }
 
+function findAcceptedPrivateChatRecognitions(
+  messages: TestMessage[],
+  identities: TestIdentity[]
+): PrivateChatRecognitionResult[] {
+  const identityNameById = new Map(identities.map((identity) => [identity.id, identity.name]));
+  const recognitions: PrivateChatRecognitionResult[] = [];
+
+  const privateMessages = messages
+    .filter((message) => message.conversationType === "private")
+    .sort((a, b) => a.sentAt - b.sentAt);
+
+  privateMessages.forEach((message, index) => {
+    if (message.sender !== "demo") return;
+
+    const requestMessage = [...privateMessages.slice(0, index)]
+      .reverse()
+      .find(
+        (candidate) =>
+          candidate.conversationId === message.conversationId &&
+          candidate.sender === "identity"
+      );
+
+    if (!requestMessage) return;
+
+    const recognition = recognizePrivateChatArrangement({
+      conversationId: message.conversationId,
+      identityName:
+        identityNameById.get(requestMessage.identityId) ?? requestMessage.identityId,
+      requestMessage: {
+        id: requestMessage.id,
+        text: requestMessage.text,
+        sentAt: requestMessage.sentAt,
+      },
+      replyMessage: {
+        id: message.id,
+        text: message.text,
+        sentAt: message.sentAt,
+      },
+      now: new Date(message.sentAt),
+    });
+
+    if (recognition) {
+      recognitions.push(recognition);
+    }
+  });
+
+  return recognitions;
+}
+
+function findAcceptedGroupChatRecognitions(
+  messages: TestMessage[],
+  identities: TestIdentity[],
+  groups: TestGroup[],
+  currentUserName: string
+): PrivateChatRecognitionResult[] {
+  const identityNameById = new Map(identities.map((identity) => [identity.id, identity.name]));
+  const groupNameById = new Map(groups.map((group) => [group.id, group.name]));
+  const recognitions: PrivateChatRecognitionResult[] = [];
+
+  const groupMessages = messages
+    .filter((message) => message.conversationType === "group")
+    .sort((a, b) => a.sentAt - b.sentAt);
+
+  groupMessages.forEach((message, index) => {
+    if (message.sender !== "demo") return;
+
+    const requestMessage = [...groupMessages.slice(0, index)]
+      .reverse()
+      .find(
+        (candidate) =>
+          candidate.conversationId === message.conversationId &&
+          candidate.sender === "identity"
+      );
+
+    if (!requestMessage) return;
+
+    const recognition = recognizeGroupChatArrangement({
+      conversationId: message.conversationId,
+      groupName: groupNameById.get(message.conversationId) ?? message.conversationId,
+      identityName:
+        identityNameById.get(requestMessage.identityId) ?? requestMessage.identityId,
+      currentUserName,
+      requestMessage: {
+        id: requestMessage.id,
+        text: requestMessage.text,
+        sentAt: requestMessage.sentAt,
+      },
+      replyMessage: {
+        id: message.id,
+        text: message.text,
+        sentAt: message.sentAt,
+      },
+      now: new Date(message.sentAt),
+    });
+
+    if (recognition) {
+      recognitions.push(recognition);
+    }
+  });
+
+  return recognitions;
+}
+
+function findPrivateChatCandidateRecordUids(messages: TestMessage[]) {
+  const privateChatCandidateIds = new Set(
+    loadAiCandidates()
+      .filter((candidate) => candidate.sourceType === "privateChat")
+      .map((candidate) => candidate.id)
+  );
+
+  if (privateChatCandidateIds.size === 0) return [];
+
+  return messages
+    .filter(
+      (message) =>
+        message.conversationType === "private" &&
+        message.sender === "identity" &&
+        privateChatCandidateIds.has(
+          buildPrivateChatCandidateId(message.conversationId, message.id)
+        )
+    )
+    .map((message) => `test-${message.id}`);
+}
+
+function findGroupChatCandidateRecordUids(messages: TestMessage[]) {
+  const groupChatCandidateIds = new Set(
+    loadAiCandidates()
+      .filter((candidate) => candidate.sourceType === "groupChat")
+      .map((candidate) => candidate.id)
+  );
+
+  if (groupChatCandidateIds.size === 0) return [];
+
+  return messages
+    .filter(
+      (message) =>
+        message.conversationType === "group" &&
+        message.sender === "identity" &&
+        groupChatCandidateIds.has(
+          buildGroupChatCandidateId(message.conversationId, message.id)
+        )
+    )
+    .map((message) => `test-${message.id}`);
+}
+
+function countPendingAiCandidates() {
+  return loadAiCandidates().filter((candidate) => candidate.status === "pending").length;
+}
+
+async function suggestArrangementCompletionFromMessage(messageText: string) {
+  const arrangements = loadArrangements();
+  let recognition = recognizeArrangementCompletion({ arrangements, messageText });
+  if (!recognition) {
+    try {
+      recognition = await recognizeArrangementCompletionWithAi({
+        settings: loadAiSettings(),
+        arrangements,
+        messageText,
+      });
+    } catch {
+      recognition = null;
+    }
+  }
+  if (!recognition) return false;
+
+  const suggestedAt = new Date().toISOString();
+  saveArrangements(
+    arrangements.map((arrangement) =>
+      arrangement.id === recognition.arrangementId
+        ? markArrangementMaybeCompleted(arrangement, suggestedAt)
+        : arrangement
+    )
+  );
+  return true;
+}
+
 function shouldRequestBrowserNotificationPermission() {
   if (typeof window === "undefined") return false;
   if (window.localStorage.getItem(browserNotificationPromptedStorageKey) === "true") {
@@ -329,6 +532,8 @@ function shouldRequestBrowserNotificationPermission() {
 
 export default function Home({ currentPage, onNavigate }: HomeProps) {
   const { t } = usePreferences();
+  const candidateProfile = useCandidateProfile();
+  const currentUserName = candidateProfile?.name ?? "";
   const [showSearch, setShowSearch] = React.useState(false);
   const [showMenu, setShowMenu] = React.useState(false);
   const [showAnswerGuide, setShowAnswerGuide] = React.useState(false);
@@ -361,6 +566,14 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
   const [testMessages, setTestMessages] = React.useState(getInitialTestMessages);
   const [testReadState, setTestReadState] =
     React.useState<TestReadState>(getInitialTestReadState);
+  const [recognizedTestRecordUids, setRecognizedTestRecordUids] = React.useState<Set<string>>(
+    () => new Set()
+  );
+  const [activeAiRecognitionFeedbackUids, setActiveAiRecognitionFeedbackUids] =
+    React.useState<Set<string>>(() => new Set());
+  const [aiRecognitionFeedbackVersions, setAiRecognitionFeedbackVersions] =
+    React.useState<Record<string, number>>({});
+  const aiRecognitionFeedbackTimeoutsRef = React.useRef<Map<string, number>>(new Map());
   const initializedBrowserNotificationMessagesRef = React.useRef(false);
   const browserNotifiedMessageIdsRef = React.useRef<Set<string>>(new Set());
 
@@ -368,6 +581,54 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
     0,
     aiConversationTotalCount - lastReadAiConversationCount
   );
+  const [pendingAiCandidateCount, setPendingAiCandidateCount] = React.useState(() =>
+    countPendingAiCandidates()
+  );
+
+  const showAiRecognitionFeedback = React.useCallback((recordUid: string) => {
+    setRecognizedTestRecordUids((currentUids) => {
+      if (currentUids.has(recordUid)) return currentUids;
+      const nextUids = new Set(currentUids);
+      nextUids.add(recordUid);
+      return nextUids;
+    });
+    setActiveAiRecognitionFeedbackUids((currentUids) => {
+      const nextUids = new Set(currentUids);
+      nextUids.add(recordUid);
+      return nextUids;
+    });
+    setAiRecognitionFeedbackVersions((currentVersions) => ({
+      ...currentVersions,
+      [recordUid]: (currentVersions[recordUid] ?? 0) + 1,
+    }));
+
+    const existingTimeout = aiRecognitionFeedbackTimeoutsRef.current.get(recordUid);
+    if (existingTimeout) {
+      window.clearTimeout(existingTimeout);
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setActiveAiRecognitionFeedbackUids((currentUids) => {
+        if (!currentUids.has(recordUid)) return currentUids;
+        const nextUids = new Set(currentUids);
+        nextUids.delete(recordUid);
+        return nextUids;
+      });
+      aiRecognitionFeedbackTimeoutsRef.current.delete(recordUid);
+    }, aiRecognitionFeedbackDurationMs);
+
+    aiRecognitionFeedbackTimeoutsRef.current.set(recordUid, timeoutId);
+  }, []);
+
+  React.useEffect(() => {
+    const feedbackTimeouts = aiRecognitionFeedbackTimeoutsRef.current;
+    return () => {
+      feedbackTimeouts.forEach((timeoutId) => {
+        window.clearTimeout(timeoutId);
+      });
+      feedbackTimeouts.clear();
+    };
+  }, []);
 
   React.useEffect(() => {
     if (typeof window === "undefined") return;
@@ -963,6 +1224,52 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
   ]);
 
   React.useEffect(() => {
+    const privateRecognitions = findAcceptedPrivateChatRecognitions(testMessages, testIdentities);
+    const groupRecognitions = findAcceptedGroupChatRecognitions(
+      testMessages,
+      testIdentities,
+      testGroups,
+      currentUserName
+    );
+    const recognitions = [...privateRecognitions, ...groupRecognitions];
+    recognitions.forEach((recognition) => {
+      upsertAiCandidate(recognition.candidate);
+    });
+    const candidateRecordUids = [
+      ...findPrivateChatCandidateRecordUids(testMessages),
+      ...findGroupChatCandidateRecordUids(testMessages),
+    ];
+    if (recognitions.length === 0 && candidateRecordUids.length === 0) return;
+
+    const feedbackRecordUids = new Set(candidateRecordUids);
+    recognitions.forEach((recognition) => {
+      feedbackRecordUids.add(`test-${recognition.recognizedMessageId}`);
+    });
+    feedbackRecordUids.forEach(showAiRecognitionFeedback);
+  }, [currentUserName, showAiRecognitionFeedback, testGroups, testIdentities, testMessages]);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const refreshPendingAiCandidateCount = () => {
+      setPendingAiCandidateCount(countPendingAiCandidates());
+    };
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === aiCandidateStorageKey) {
+        refreshPendingAiCandidateCount();
+      }
+    };
+
+    window.addEventListener("storage", handleStorage);
+    window.addEventListener(aiCandidateStorageEvent, refreshPendingAiCandidateCount);
+    return () => {
+      window.removeEventListener("storage", handleStorage);
+      window.removeEventListener(aiCandidateStorageEvent, refreshPendingAiCandidateCount);
+    };
+  }, []);
+
+  React.useEffect(() => {
     const identityMessages = testMessages.filter(
       (message) => message.sender === "identity"
     );
@@ -1029,14 +1336,125 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
       content,
       summary.conversationType
     );
+    const latestIdentityMessage = [...testMessages]
+      .filter(
+        (message) =>
+          message.conversationId === summary.conversationId &&
+          message.conversationType === summary.conversationType &&
+          message.sender === "identity"
+      )
+      .sort((a, b) => b.sentAt - a.sentAt)[0];
+
+    void suggestArrangementCompletionFromMessage(reply.text);
+
+    if (summary.conversationType === "private" && latestIdentityMessage) {
+      const localRecognition = recognizePrivateChatArrangement({
+        conversationId: summary.conversationId,
+        identityName: summary.identity?.name ?? summary.title,
+        requestMessage: {
+          id: latestIdentityMessage.id,
+          text: latestIdentityMessage.text,
+          sentAt: latestIdentityMessage.sentAt,
+        },
+        replyMessage: {
+          id: reply.id,
+          text: reply.text,
+          sentAt: reply.sentAt,
+        },
+      });
+
+      if (localRecognition) {
+        upsertAiCandidate(localRecognition.candidate);
+      }
+
+      recognizePrivateChatArrangementWithAi({
+        settings: loadAiSettings(),
+        conversationId: summary.conversationId,
+        identityName: summary.identity?.name ?? summary.title,
+        requestMessage: {
+          id: latestIdentityMessage.id,
+          text: latestIdentityMessage.text,
+          sentAt: latestIdentityMessage.sentAt,
+        },
+        replyMessage: {
+          id: reply.id,
+          text: reply.text,
+          sentAt: reply.sentAt,
+        },
+      })
+        .then((recognition) => {
+          if (!recognition) return;
+          upsertAiCandidate(recognition.candidate);
+          showAiRecognitionFeedback(`test-${recognition.recognizedMessageId}`);
+          setPendingAiCandidateCount(countPendingAiCandidates());
+        })
+        .catch(() => undefined);
+    }
+
+    if (summary.conversationType === "group" && latestIdentityMessage) {
+      const identityName =
+        summary.memberIdentities.find(
+          (identity) => identity.id === latestIdentityMessage.identityId
+        )?.name ?? latestIdentityMessage.identityId;
+      const localRecognition = recognizeGroupChatArrangement({
+        conversationId: summary.conversationId,
+        groupName: summary.group?.name ?? summary.title,
+        identityName,
+        currentUserName,
+        requestMessage: {
+          id: latestIdentityMessage.id,
+          text: latestIdentityMessage.text,
+          sentAt: latestIdentityMessage.sentAt,
+        },
+        replyMessage: {
+          id: reply.id,
+          text: reply.text,
+          sentAt: reply.sentAt,
+        },
+      });
+
+      if (localRecognition) {
+        upsertAiCandidate(localRecognition.candidate);
+        showAiRecognitionFeedback(`test-${localRecognition.recognizedMessageId}`);
+        setTestConversationTargetUid(`test-${localRecognition.recognizedMessageId}`);
+        setPendingAiCandidateCount(countPendingAiCandidates());
+      }
+
+      recognizeGroupChatArrangementWithAi({
+        settings: loadAiSettings(),
+        conversationId: summary.conversationId,
+        groupName: summary.group?.name ?? summary.title,
+        identityName,
+        currentUserName,
+        requestMessage: {
+          id: latestIdentityMessage.id,
+          text: latestIdentityMessage.text,
+          sentAt: latestIdentityMessage.sentAt,
+        },
+        replyMessage: {
+          id: reply.id,
+          text: reply.text,
+          sentAt: reply.sentAt,
+        },
+      })
+        .then((recognition) => {
+          if (!recognition) return;
+          upsertAiCandidate(recognition.candidate);
+          showAiRecognitionFeedback(`test-${recognition.recognizedMessageId}`);
+          setTestConversationTargetUid(`test-${recognition.recognizedMessageId}`);
+          setPendingAiCandidateCount(countPendingAiCandidates());
+        })
+        .catch(() => undefined);
+    }
+
     setTestMessages((prev) => {
       const nextMessages = [...prev, reply];
       persistTestMessages(nextMessages);
       return nextMessages;
     });
     markTestConversationAsRead(summary.conversationId);
-    setTestConversationTargetUid(`test-${reply.id}`);
-  }, [markTestConversationAsRead]);
+    setTestConversationTargetUid((currentUid) => currentUid ?? `test-${reply.id}`);
+  }, [currentUserName, markTestConversationAsRead, showAiRecognitionFeedback, testMessages]);
 
   const openSourceConversation = React.useCallback(
     (source: RecordSourceConversation) => {
@@ -1133,6 +1551,9 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
           onOpenRecordDetail={setRecordDetail}
           onOpenRecordSnapshot={setRecordSnapshot}
           onCreateReply={(content) => createTestReply(activeTestConversationSummary, content)}
+          recognizedRecordUids={recognizedTestRecordUids}
+          activeRecognitionFeedbackUids={activeAiRecognitionFeedbackUids}
+          recognitionFeedbackVersions={aiRecognitionFeedbackVersions}
         />
       );
     }
@@ -1174,6 +1595,10 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
       return <InsightPreview />;
     }
 
+    if (currentPage === "arrangements") {
+      return <ArrangementsPage />;
+    }
+
     return (
       <div className="flex h-full flex-col bg-bg">
         <MobileHeader
@@ -1209,7 +1634,11 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
         <div className="relative flex min-h-0 flex-1 flex-col">
           <main className="min-h-0 flex-1 overflow-hidden">{renderMainContent()}</main>
           {!recordDetail && !showSearch && !showAnswerGuide && !showAiConversation && !showSendToSelf && !showTestConversation && !settingsView && (
-            <MobileBottomNavigation currentPage={currentPage} onNavigate={onNavigate} />
+            <MobileBottomNavigation
+              currentPage={currentPage}
+              pendingAiCandidateCount={pendingAiCandidateCount}
+              onNavigate={onNavigate}
+            />
           )}
           <MobileSideDrawer
             open={showMenu}
@@ -2079,6 +2508,7 @@ function TestConversationDrawerItem({
       type="button"
       className="flex w-full items-center px-4 py-2.5 text-left transition hover:bg-bg active:scale-[0.99]"
       onClick={onClick}
+      data-testid={`test-conversation-drawer-item-${summary.conversationId}`}
     >
       <AvatarUnreadWrap unreadCount={summary.unreadCount}>
         <TestConversationAvatar summary={summary} className="h-[30px] w-[30px]" />
@@ -2381,6 +2811,9 @@ function TestIdentityConversationChat({
   onOpenRecordDetail,
   onOpenRecordSnapshot,
   onCreateReply,
+  recognizedRecordUids,
+  activeRecognitionFeedbackUids,
+  recognitionFeedbackVersions,
 }: {
   summary: TestConversationSummary;
   targetUid?: string | null;
@@ -2388,6 +2821,9 @@ function TestIdentityConversationChat({
   onOpenRecordDetail: (record: RecordItem) => void;
   onOpenRecordSnapshot: (record: RecordItem) => void;
   onCreateReply: (content: string) => void;
+  recognizedRecordUids: Set<string>;
+  activeRecognitionFeedbackUids: Set<string>;
+  recognitionFeedbackVersions: Record<string, number>;
 }) {
   const { resolvedLocale, t } = usePreferences();
   const candidateProfile = useCandidateProfile();
@@ -2446,6 +2882,9 @@ function TestIdentityConversationChat({
             const prevRecord = sortedRecords[index - 1];
             const showTime =
               index === 0 || shouldShowConversationTime(prevRecord.send_at, record.send_at);
+            const hasAiRecognition = recognizedRecordUids.has(record.uid);
+            const showAiRecognitionFeedback = activeRecognitionFeedbackUids.has(record.uid);
+            const recognitionFeedbackVersion = recognitionFeedbackVersions[record.uid] ?? 0;
 
             return (
               <div
@@ -2502,15 +2941,38 @@ function TestIdentityConversationChat({
                           )?.name ?? "群成员"}
                         </p>
                       )}
-                      <button
-                        type="button"
-                        className="max-w-full rounded-[14px] rounded-tl-[4px] bg-surface px-3.5 py-2.5 text-left text-text shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition hover:bg-[var(--record-card-hover-bg)] active:scale-[0.99]"
-                        onClick={() => onOpenRecordDetail(record)}
-                      >
-                        <p className="whitespace-pre-wrap break-words text-[14px] leading-[1.55]">
-                          {record.text_content}
-                        </p>
-                      </button>
+                      <div className="relative inline-flex max-w-full flex-col items-stretch">
+                        <button
+                          type="button"
+                          className="relative z-[1] max-w-full rounded-[14px] rounded-tl-[4px] bg-surface px-3.5 py-2.5 text-left text-text shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition hover:bg-[var(--record-card-hover-bg)] active:scale-[0.99]"
+                          data-testid={`chat-message-bubble-${record.uid}`}
+                          data-ai-recognition={hasAiRecognition ? "true" : undefined}
+                          onClick={() => onOpenRecordDetail(record)}
+                        >
+                          <p className="whitespace-pre-wrap break-words text-[14px] leading-[1.55]">
+                            {record.text_content}
+                          </p>
+                        </button>
+                        {showAiRecognitionFeedback && (
+                          <span
+                            key={`${record.uid}-${recognitionFeedbackVersion}`}
+                            className="ai-recognition-feedback-bed"
+                            data-testid={`chat-ai-recognition-feedback-bed-${record.uid}`}
+                            aria-hidden="true"
+                          >
+                            <span
+                              className="ai-recognition-background-glow"
+                              data-testid={`chat-ai-recognition-background-glow-${record.uid}`}
+                              aria-hidden="true"
+                            />
+                            <span
+                              className="ai-recognition-background-ripple"
+                              data-testid={`chat-ai-recognition-background-ripple-${record.uid}`}
+                              aria-hidden="true"
+                            />
+                          </span>
+                        )}
+                      </div>
                     </div>
                   </div>
                 )}
@@ -2673,9 +3135,11 @@ function AnswerGuideChat({ onBack }: { onBack: () => void }) {
 
 function MobileBottomNavigation({
   currentPage,
+  pendingAiCandidateCount,
   onNavigate,
 }: {
   currentPage: PageType;
+  pendingAiCandidateCount: number;
   onNavigate: (page: PageType) => void;
 }) {
   const { t } = usePreferences();
@@ -2689,6 +3153,7 @@ function MobileBottomNavigation({
             <button
               key={tab.key}
               type="button"
+              data-testid={`mobile-tab-${tab.key}`}
               onClick={() => onNavigate(tab.key)}
               className={cn(
                 "flex h-full flex-1 items-center justify-center rounded-[10px] text-base transition active:scale-[0.98]",
@@ -2697,7 +3162,18 @@ function MobileBottomNavigation({
                   : "font-normal text-text-tertiary"
               )}
             >
-              {getTabLabel(tab.key, t)}
+              <span className="relative inline-flex items-center justify-center">
+                {getTabLabel(tab.key, t)}
+                {tab.key === "arrangements" && pendingAiCandidateCount > 0 && (
+                  <span
+                    aria-label={`${pendingAiCandidateCount} 个待确认 AI 候选安排`}
+                    className="absolute -right-4 -top-1.5 min-w-[16px] rounded-full bg-primary/15 px-1 text-[10px] font-semibold leading-4 text-primary"
+                    data-testid="arrangements-tab-pending-candidate-badge"
+                  >
+                    {pendingAiCandidateCount > 9 ? "9+" : pendingAiCandidateCount}
+                  </span>
+                )}
+              </span>
             </button>
           );
         })}
@@ -3430,6 +3906,7 @@ function ThemePreview({ mode }: { mode: ResolvedTheme }) {
 
 function getTabLabel(page: PageType, t: ReturnType<typeof usePreferences>["t"]) {
   if (page === "records") return t("tabs.records");
+  if (page === "arrangements") return "安排";
   if (page === "insight") return t("tabs.insight");
   return t("tabs.mine");
 }

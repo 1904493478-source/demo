@@ -10,6 +10,8 @@ type ModalProps = {
   children: React.ReactNode;
   className?: string;
   closeLabel?: string;
+  showCloseButton?: boolean;
+  contentTestId?: string;
 };
 
 export default function Modal({
@@ -19,7 +21,23 @@ export default function Modal({
   children,
   className,
   closeLabel = "Close",
+  showCloseButton = true,
+  contentTestId,
 }: ModalProps) {
+  React.useEffect(() => {
+    if (!open) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose, open]);
+
   if (!open) return null;
 
   return ReactDOM.createPortal(
@@ -36,12 +54,21 @@ export default function Modal({
         )}
         role="dialog"
         aria-modal="true"
+        aria-label={title}
+        data-testid={contentTestId}
       >
-        <div className="mb-4 flex items-center justify-between">
+        <div
+          className={cn(
+            "mb-4 flex items-center",
+            showCloseButton ? "justify-between" : "justify-start"
+          )}
+        >
           {title && <h2 className="text-base font-semibold text-text">{title}</h2>}
-          <Button variant="ghost" onClick={onClose} aria-label={closeLabel}>
-            {closeLabel}
-          </Button>
+          {showCloseButton ? (
+            <Button variant="ghost" onClick={onClose} aria-label={closeLabel}>
+              {closeLabel}
+            </Button>
+          ) : null}
         </div>
         {children}
       </div>

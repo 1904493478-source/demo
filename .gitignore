@@ -8,3 +8,5 @@ tailwind.config.d.ts
 pnpm-debug.log*
 .DS_Store
 .codex/
+.superpowers/
+vite-dev.log

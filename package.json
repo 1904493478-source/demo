@@ -11,20 +11,26 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "lint": "eslint .",
     "prepare": "node scripts/setup-git-hooks.mjs",
     "setup:git-hooks": "node scripts/setup-git-hooks.mjs",
+    "devlog:update": "node scripts/update-dev-log.mjs",
     "codex:init-log": "node scripts/ensure-candidate-log.mjs",
     "codex:upload-interview": "node scripts/upload-codex-interview.mjs",
     "verify:codex-log": "node scripts/verify-codex-log.mjs",
+    "check:encoding": "node scripts/check-text-encoding.mjs",
     "verify:answer-standard": "node scripts/verify-answer-standard.mjs",
-    "verify:answer": "pnpm lint && pnpm build && pnpm verify:codex-log && pnpm verify:answer-standard"
+    "verify:answer": "pnpm check:encoding && pnpm lint && pnpm build && pnpm verify:codex-log && pnpm verify:answer-standard"
   },
   "dependencies": {
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
     "@types/node": "^22.10.2",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
@@ -35,9 +41,11 @@
     "eslint": "^8.57.0",
     "eslint-plugin-react": "^7.34.1",
     "eslint-plugin-react-hooks": "^4.6.2",
+    "jsdom": "^29.1.1",
     "postcss": "^8.4.39",
     "tailwindcss": "^3.4.7",
     "typescript": "^5.5.4",
-    "vite": "^5.3.4"
+    "vite": "^5.3.4",
+    "vitest": "^2.1.9"
   }
 }
